@@ -6,6 +6,14 @@
 #include <assert.h>
 #include <mpi.h>
 
+// Quantidade de pivôs que cada processo vai processar antes de comunicar com
+// o processo seguinte
+#define BLOCK_SIZE 20
+
+#define DEBUG(fmt, args...)                                         \
+	if (getenv("DEBUG") != NULL && strcmp(getenv("DEBUG"), "1") == 0) \
+		printf("PROC(%d): " fmt "\n", procidx, ##args);
+
 void saveResult(double *A, double *b, double *x, int n);
 int testLinearSystem(double *A, double *b, double *x, int n);
 void loadLinearSystem(int n, double *A, double *b);
@@ -13,7 +21,7 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 
 int main(int argc, char **argv)
 {
-	int n, local_n, procidx, totalprocs;
+	int n, local_n, procidx, totalprocs, remaining;
 	double *A, *b, *x;
 	double *local_A, *local_b;
 
@@ -25,7 +33,7 @@ int main(int argc, char **argv)
 	{
 		if (procidx == 0)
 		{
-			fprintf(stderr, "Uso: %s [options] <n>\n", argv[0]);
+			fprintf(stderr, "Uso: %s <n>\n", argv[0]);
 		}
 		return EXIT_FAILURE;
 	}
@@ -41,11 +49,14 @@ int main(int argc, char **argv)
 
 	n = atoi(argv[argc - 1]);
 	local_n = n / totalprocs;
+	remaining = n % totalprocs;
 	local_A = (double *)malloc(local_n * n * sizeof(double));
 	local_b = (double *)malloc(local_n * sizeof(double));
 
 	if (procidx == 0)
 	{
+		DEBUG("Inicializando (totalprocs=%d, local_n=%d, remaining=%d, BLOCK_SIZE=%d)", totalprocs, local_n, remaining, BLOCK_SIZE);
+
 		A = (double *)malloc(n * n * sizeof(double));
 		b = (double *)malloc(n * sizeof(double));
 		x = (double *)malloc(n * sizeof(double));
@@ -61,6 +72,9 @@ int main(int argc, char **argv)
 							0, MPI_COMM_WORLD);
 
 	solveLinearSystem(local_A, local_b, x, n, local_n, procidx, totalprocs);
+
+	// Aguarda todos os processos finalizarem
+	MPI_Barrier(MPI_COMM_WORLD);
 
 	if (procidx == 0)
 	{
@@ -109,7 +123,7 @@ int testLinearSystem(double *A, double *b, double *x, int n)
 		sum = 0;
 		for (j = 0; j < n; j++)
 			sum += A[i * n + j] * x[j];
-		if (abs(sum - b[i]) >= 0.001)
+		if (fabs(sum - b[i]) >= 0.001)
 		{
 			printf("%f\n", (sum - b[i]));
 			c++;
@@ -152,41 +166,74 @@ void loadLinearSystem(int n, double *A, double *b)
 
 void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int local_n, int procidx, int totalprocs)
 {
-	int pivot_row, pivot_owner, local_pivot_row, current_row_start, current_row, count;
+	DEBUG("solveLinearSystem");
+
+	int pivot_row, pivot_owner, local_pivot_row, current_row_start, current_row, count,
+			pivot_unit, local_pivot_offset, local_pivot_buffer_mat_size, block_tag = 0;
 	double pivot, b_pivot, ratio;
 
 	// Buffer para armazenar a linha de pivô + elemento b
-	double *pivot_buffer = (double *)malloc((n + 1) * sizeof(double));
+	// Usamos uma "matriz" para armazenar BLOCK_SIZE por vez para reduzir a quantidade de comunicações
+	// Assim, cada processo calculará primeiro BLOCK_SIZE pivôs antes de passar o trabalho para
+	// os próximos processos
+	int pivot_buffer_size = n + 1;															// Tamanho do buffer para 1 pivô
+	int pivot_buffer_mat_size = pivot_buffer_size * BLOCK_SIZE; // Tamanho da matriz do buffer de pivô
+	double *pivot_buffer = (double *)malloc(pivot_buffer_mat_size * sizeof(double));
+
+	MPI_Status status;
 
 	/* Gaussian Elimination */
 	for (pivot_row = 0; pivot_row < (n - 1); pivot_row++)
 	{
 		pivot_owner = pivot_row / local_n;
 		local_pivot_row = pivot_row % local_n;
+		// Calcula pivot_unit relativo ao início de cada processo
+		pivot_unit = local_pivot_row % BLOCK_SIZE;
+		local_pivot_offset = pivot_unit * pivot_buffer_size;
 
 		if (procidx == pivot_owner)
 		{
-			// O pivô está dentro da área deste processo, então copiamos a linha local para o buffer do pivô
-			memcpy(pivot_buffer, &local_A[local_pivot_row * n], n * sizeof(double));
-			pivot_buffer[n] = local_b[local_pivot_row];
+			local_pivot_buffer_mat_size = pivot_buffer_size * (pivot_unit + 1);
 
-			// Envio para o "próximo" processo (se houver)
-			if (procidx < totalprocs - 1)
+			// O pivô está dentro da área deste processo, então copiamos a linha local para o buffer do pivô
+			memcpy(&pivot_buffer[local_pivot_offset], &local_A[local_pivot_row * n], n * sizeof(double));
+			pivot_buffer[local_pivot_offset + n] = local_b[local_pivot_row];
+
+			// Envio para o "próximo" processo (se houver), a cada BLOCK_SIZE ou se for a última linha
+			if (procidx < totalprocs - 1 && (pivot_unit == BLOCK_SIZE - 1 || local_pivot_row == local_n - 1))
 			{
+				DEBUG(
+						"ENVIANDO pivô %d..%d para PROC(%d) (tag=%d, pivot_unit=%d, size=%d)",
+						(pivot_row - pivot_unit), pivot_row, procidx + 1, block_tag, pivot_unit, local_pivot_buffer_mat_size);
+
 				// Usamos 'pivot_row' como tag da mensagem
-				MPI_Send(pivot_buffer, n + 1, MPI_DOUBLE, procidx + 1, pivot_row, MPI_COMM_WORLD);
+				MPI_Send(pivot_buffer, local_pivot_buffer_mat_size, MPI_DOUBLE, procidx + 1, block_tag, MPI_COMM_WORLD);
+				block_tag++;
 			}
 		}
 		else if (procidx > pivot_owner)
 		{
-			// Este processo está "abaixo" do processo dono do pivô, então recebe as informações do pivô do
-			// processo anterior
-			MPI_Recv(pivot_buffer, n + 1, MPI_DOUBLE, procidx - 1, pivot_row, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-			// Reenvio para o "próximo" processo (se eu não for o último)
-			if (procidx < totalprocs - 1)
+			if (pivot_unit == 0)
 			{
-				MPI_Send(pivot_buffer, n + 1, MPI_DOUBLE, procidx + 1, pivot_row, MPI_COMM_WORLD);
+				MPI_Probe(procidx - 1, block_tag, MPI_COMM_WORLD, &status);
+				MPI_Get_count(&status, MPI_DOUBLE, &local_pivot_buffer_mat_size);
+
+				DEBUG(
+						"RECEBENDO pivô %d..%d de PROC(%d) (tag=%d, pivot_unit=%d, size=%d)",
+						pivot_row, pivot_row + local_pivot_buffer_mat_size / pivot_buffer_size - 1, procidx - 1, block_tag, pivot_unit,
+						local_pivot_buffer_mat_size);
+
+				// Este processo está "abaixo" do processo dono do pivô, então recebe as informações do pivô do
+				// processo anterior
+				MPI_Recv(pivot_buffer, local_pivot_buffer_mat_size, MPI_DOUBLE, procidx - 1, block_tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+				// Reenvio para o "próximo" processo (se eu não for o último)
+				if (procidx < totalprocs - 1)
+				{
+					MPI_Send(pivot_buffer, local_pivot_buffer_mat_size, MPI_DOUBLE, procidx + 1, block_tag, MPI_COMM_WORLD);
+				}
+
+				block_tag++;
 			}
 		}
 		else
@@ -196,8 +243,8 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 			break;
 		}
 
-		pivot = pivot_buffer[pivot_row];
-		b_pivot = pivot_buffer[n];
+		pivot = pivot_buffer[local_pivot_offset + pivot_row];
+		b_pivot = pivot_buffer[local_pivot_offset + n];
 
 		// Se o pivô estiver dentro da área do processo atual, inicia a partir do pivô
 		// Caso contrário, sempre inicia em 0 pois o processo estará computando sua
@@ -207,10 +254,13 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 		// Processa somente até o final da área atribuída a esse processo
 		for (current_row = current_row_start; current_row < local_n; current_row++)
 		{
+			if (current_row == current_row_start)
+				DEBUG("PROCESSANDO pivô %d da linha %d até %d", pivot_row, procidx * local_n + current_row_start, procidx * local_n + local_n);
+
 			ratio = local_A[current_row * n + pivot_row] / pivot;
 			for (count = pivot_row; count < n; count++)
 			{
-				local_A[current_row * n + count] -= (ratio * pivot_buffer[count]);
+				local_A[current_row * n + count] -= (ratio * pivot_buffer[local_pivot_offset + count]);
 			}
 			local_b[current_row] -= (ratio * b_pivot);
 		}
@@ -237,7 +287,7 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 
 	if (procidx != 0)
 	{
-		// A partir daqui, somente o processo 0 preciso calcular de forma sequencial
+		// A partir daqui, somente o processo 0 precisa calcular de forma sequencial
 		return;
 	}
 

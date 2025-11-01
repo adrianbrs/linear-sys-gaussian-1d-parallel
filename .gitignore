@@ -2,3 +2,5 @@ gauss
 gauss_mpi
 result.out
 *.in
+*.log
+benchmark*.json

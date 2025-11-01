@@ -171,6 +171,9 @@ void loadLinearSystem(int n, double *A, double *b)
 
 void solveLinearSystem(const double *A, const double *b, double *x, int n)
 {
+	struct timeval tv_start, tv_end;
+	gettimeofday(&tv_start, NULL);
+
 	double *Acpy = (double *)malloc(n * n * sizeof(double));
 	double *bcpy = (double *)malloc(n * sizeof(double));
 	memcpy(Acpy, A, n * n * sizeof(double));
@@ -181,7 +184,6 @@ void solveLinearSystem(const double *A, const double *b, double *x, int n)
 	/* Gaussian Elimination */
 	for (i = 0; i < (n - 1); i++)
 	{
-
 		for (j = (i + 1); j < n; j++)
 		{
 			double ratio = Acpy[j * n + i] / Acpy[i * n + i];
@@ -204,4 +206,11 @@ void solveLinearSystem(const double *A, const double *b, double *x, int n)
 		}
 		x[i] = temp / Acpy[i * n + i];
 	}
+
+	gettimeofday(&tv_end, NULL);
+	double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1e6;
+	printf("Tempo total solveLinearSystem = %.6f segundos\n", elapsed);
+
+	free(Acpy);
+	free(bcpy);
 }

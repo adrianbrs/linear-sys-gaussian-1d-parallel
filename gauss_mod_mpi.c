@@ -6,13 +6,21 @@
 #include <assert.h>
 #include <mpi.h>
 
-// Quantidade de pivôs que cada processo vai processar antes de comunicar com
-// o processo seguinte
-#define BLOCK_SIZE 20
+// Tamanho do bloco de pivôs que data processo vai finalizar antes de se comunicar
+// com o próximo processo no pipeline
+#define BLOCK_SIZE (getenv("BLOCK_SIZE") ? atoi(getenv("BLOCK_SIZE")) : 20)
 
+// Exibe mensagens no console se `DEBUG=1`
 #define DEBUG(fmt, args...)                                         \
 	if (getenv("DEBUG") != NULL && strcmp(getenv("DEBUG"), "1") == 0) \
 		printf("PROC(%d): " fmt "\n", procidx, ##args);
+
+// Exibe mensagem na saída stderr (se for o processo `0`) e finaliza o programa
+#define RTHROW(fmt, args...)           \
+	if (procidx == 0)                    \
+		fprintf(stderr, fmt "\n", ##args); \
+	MPI_Finalize();                      \
+	exit(EXIT_FAILURE);
 
 void saveResult(double *A, double *b, double *x, int n);
 int testLinearSystem(double *A, double *b, double *x, int n);
@@ -21,7 +29,7 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 
 int main(int argc, char **argv)
 {
-	int n, local_n, procidx, totalprocs, remaining;
+	int n, local_n, procidx, totalprocs, base, rem;
 	double *A, *b, *x;
 	double *local_A, *local_b;
 
@@ -31,31 +39,30 @@ int main(int argc, char **argv)
 
 	if (argc < 2)
 	{
-		if (procidx == 0)
-		{
-			fprintf(stderr, "Uso: %s <n>\n", argv[0]);
-		}
-		return EXIT_FAILURE;
+		RTHROW("Uso: %s <n>", argv[0]);
 	}
 
 	if (!(totalprocs == 2 || totalprocs == 4 || totalprocs == 8 || totalprocs == 16 || totalprocs == 32))
 	{
-		if (procidx == 0)
-		{
-			fprintf(stderr, "Número de processos (%d) inválido, suportados apenas: 2, 4, 8, 16 ou 32", totalprocs);
-		}
-		return EXIT_FAILURE;
+		RTHROW("Número de processos (%d) inválido, suportados apenas: 2, 4, 8, 16 ou 32", totalprocs);
+	}
+
+	if (BLOCK_SIZE <= 0)
+	{
+		RTHROW("Valor de BLOCK_SIZE deve ser positivo");
 	}
 
 	n = atoi(argv[argc - 1]);
-	local_n = n / totalprocs;
-	remaining = n % totalprocs;
+
+	base = n / totalprocs;
+	rem = n % totalprocs;
+	local_n = base + (procidx < rem ? 1 : 0);
 	local_A = (double *)malloc(local_n * n * sizeof(double));
 	local_b = (double *)malloc(local_n * sizeof(double));
 
 	if (procidx == 0)
 	{
-		DEBUG("Inicializando (totalprocs=%d, local_n=%d, remaining=%d, BLOCK_SIZE=%d)", totalprocs, local_n, remaining, BLOCK_SIZE);
+		DEBUG("Inicializando (totalprocs=%d, base=%d, rem=%d, BLOCK_SIZE=%d)", totalprocs, base, rem, BLOCK_SIZE);
 
 		A = (double *)malloc(n * n * sizeof(double));
 		b = (double *)malloc(n * sizeof(double));
@@ -63,15 +70,42 @@ int main(int argc, char **argv)
 		loadLinearSystem(n, A, b);
 	}
 
-	MPI_Scatter(A, local_n * n, MPI_DOUBLE,
-							local_A, local_n * n, MPI_DOUBLE,
-							0, MPI_COMM_WORLD);
+	int *sendcounts_A = NULL, *displs_A = NULL, *sendcounts_b = NULL, *displs_b = NULL, p, rows_p, start_p;
+	if (procidx == 0)
+	{
+		sendcounts_A = (int *)malloc(totalprocs * sizeof(int));
+		displs_A = (int *)malloc(totalprocs * sizeof(int));
+		sendcounts_b = (int *)malloc(totalprocs * sizeof(int));
+		displs_b = (int *)malloc(totalprocs * sizeof(int));
 
-	MPI_Scatter(b, local_n, MPI_DOUBLE,
-							local_b, local_n, MPI_DOUBLE,
-							0, MPI_COMM_WORLD);
+		for (p = 0; p < totalprocs; p++)
+		{
+			rows_p = base + (p < rem ? 1 : 0);
+			start_p = (p < rem) ? (p * (base + 1)) : (rem * (base + 1) + (p - rem) * base);
+			sendcounts_A[p] = rows_p * n;
+			displs_A[p] = start_p * n;
+			sendcounts_b[p] = rows_p;
+			displs_b[p] = start_p;
+		}
+	}
+
+	// Distribui as linhas da matriz entre os processos. Caso o número de linhas não seja múltiplo
+	// do número de processos, alguns processos receberam local_n + 1, enquanto o restante somente local_n
+	// Assim distribuímos de forma uniforme o resto das linhas entre os processos
+	MPI_Scatterv((procidx == 0) ? A : NULL, sendcounts_A, displs_A, MPI_DOUBLE,
+							 local_A, local_n * n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	MPI_Scatterv((procidx == 0) ? b : NULL, sendcounts_b, displs_b, MPI_DOUBLE,
+							 local_b, local_n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
 	solveLinearSystem(local_A, local_b, x, n, local_n, procidx, totalprocs);
+
+	if (procidx == 0)
+	{
+		free(sendcounts_A);
+		free(displs_A);
+		free(sendcounts_b);
+		free(displs_b);
+	}
 
 	// Aguarda todos os processos finalizarem
 	MPI_Barrier(MPI_COMM_WORLD);
@@ -169,7 +203,7 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 	DEBUG("solveLinearSystem");
 
 	int pivot_row, pivot_owner, local_pivot_row, current_row_start, current_row, count,
-			pivot_unit, local_pivot_offset, local_pivot_buffer_mat_size, block_tag = 0;
+			pivot_unit, local_pivot_offset, local_pivot_buffer_mat_size, block_tag = 0, start_owner;
 	double pivot, b_pivot, ratio;
 
 	// Buffer para armazenar a linha de pivô + elemento b
@@ -182,12 +216,19 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 
 	MPI_Status status;
 
+	/* Compute base and remainder once; we'll derive owner and starts arithmetically
+		 This avoids allocating rows/starts arrays and a while-loop per pivot. */
+	int base = n / totalprocs;
+	int rem = n % totalprocs;
+	int threshold = (base + 1) * rem; /* first 'rem' processes have (base+1) rows */
+
 	/* Gaussian Elimination */
 	for (pivot_row = 0; pivot_row < (n - 1); pivot_row++)
 	{
-		pivot_owner = pivot_row / local_n;
-		local_pivot_row = pivot_row % local_n;
-		// Calcula pivot_unit relativo ao início de cada processo
+		pivot_owner = pivot_row < threshold ? (pivot_owner = pivot_row / (base + 1)) : rem + (pivot_row - threshold) / base;
+		start_owner = (pivot_owner < rem) ? (pivot_owner * (base + 1)) : (rem * (base + 1) + (pivot_owner - rem) * base);
+		local_pivot_row = pivot_row - start_owner;
+		// Calcula pivot_unit relativo ao início do processo dono
 		pivot_unit = local_pivot_row % BLOCK_SIZE;
 		local_pivot_offset = pivot_unit * pivot_buffer_size;
 
@@ -213,6 +254,8 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 		}
 		else if (procidx > pivot_owner)
 		{
+			// Podemos sempre esperar ler no inicio de um bloco, pois se o processo anterior não tiver um bloco inteiro para
+			// processar, esse processo estará esperando igual e receberá o bloco parcial
 			if (pivot_unit == 0)
 			{
 				MPI_Probe(procidx - 1, block_tag, MPI_COMM_WORLD, &status);
@@ -278,12 +321,39 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 	}
 
 	// Agrupa novamente os valores calculados de todos os processos no processo root
-	MPI_Gather(local_A, local_n * n, MPI_DOUBLE,
-						 res_A, local_n * n, MPI_DOUBLE,
-						 0, MPI_COMM_WORLD);
-	MPI_Gather(local_b, local_n, MPI_DOUBLE,
-						 res_b, local_n, MPI_DOUBLE,
-						 0, MPI_COMM_WORLD);
+	int *recvcounts_A = NULL, *recvdispls_A = NULL, *recvcounts_b = NULL, *recvdispls_b = NULL, p, rows_p, start_p;
+	if (procidx == 0)
+	{
+		recvcounts_A = (int *)malloc(totalprocs * sizeof(int));
+		recvdispls_A = (int *)malloc(totalprocs * sizeof(int));
+		recvcounts_b = (int *)malloc(totalprocs * sizeof(int));
+		recvdispls_b = (int *)malloc(totalprocs * sizeof(int));
+
+		for (p = 0; p < totalprocs; p++)
+		{
+			rows_p = base + (p < rem ? 1 : 0);
+			start_p = (p < rem) ? (p * (base + 1)) : (rem * (base + 1) + (p - rem) * base);
+			recvcounts_A[p] = rows_p * n;
+			recvdispls_A[p] = start_p * n;
+			recvcounts_b[p] = rows_p;
+			recvdispls_b[p] = start_p;
+		}
+	}
+
+	MPI_Gatherv(local_A, local_n * n, MPI_DOUBLE,
+							res_A, recvcounts_A, recvdispls_A, MPI_DOUBLE,
+							0, MPI_COMM_WORLD);
+	MPI_Gatherv(local_b, local_n, MPI_DOUBLE,
+							res_b, recvcounts_b, recvdispls_b, MPI_DOUBLE,
+							0, MPI_COMM_WORLD);
+
+	if (procidx == 0)
+	{
+		free(recvcounts_A);
+		free(recvdispls_A);
+		free(recvcounts_b);
+		free(recvdispls_b);
+	}
 
 	if (procidx != 0)
 	{

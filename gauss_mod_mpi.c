@@ -32,6 +32,11 @@ int main(int argc, char **argv)
 	int n, local_n, procidx, totalprocs, base, rem;
 	double *A, *b, *x;
 	double *local_A, *local_b;
+	double t_total;
+	double t_load;
+	double t_comm;
+	double t_solve;
+	double t_test;
 
 	MPI_Init(&argc, &argv);
 	MPI_Comm_rank(MPI_COMM_WORLD, &procidx);
@@ -54,6 +59,11 @@ int main(int argc, char **argv)
 
 	n = atoi(argv[argc - 1]);
 
+	if (procidx == 0)
+	{
+		t_total = MPI_Wtime();
+	}
+
 	base = n / totalprocs;
 	rem = n % totalprocs;
 	local_n = base + (procidx < rem ? 1 : 0);
@@ -67,7 +77,9 @@ int main(int argc, char **argv)
 		A = (double *)malloc(n * n * sizeof(double));
 		b = (double *)malloc(n * sizeof(double));
 		x = (double *)malloc(n * sizeof(double));
+		t_load = MPI_Wtime();
 		loadLinearSystem(n, A, b);
+		t_load = MPI_Wtime() - t_load;
 	}
 
 	int *sendcounts_A = NULL, *displs_A = NULL, *sendcounts_b = NULL, *displs_b = NULL, p, rows_p, start_p;
@@ -92,12 +104,20 @@ int main(int argc, char **argv)
 	// Distribui as linhas da matriz entre os processos. Caso o número de linhas não seja múltiplo
 	// do número de processos, alguns processos receberam local_n + 1, enquanto o restante somente local_n
 	// Assim distribuímos de forma uniforme o resto das linhas entre os processos
+	if (procidx == 0)
+		t_comm = MPI_Wtime();
 	MPI_Scatterv((procidx == 0) ? A : NULL, sendcounts_A, displs_A, MPI_DOUBLE,
 							 local_A, local_n * n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 	MPI_Scatterv((procidx == 0) ? b : NULL, sendcounts_b, displs_b, MPI_DOUBLE,
 							 local_b, local_n, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+	if (procidx == 0)
+		t_comm = MPI_Wtime() - t_comm;
 
+	if (procidx == 0)
+		t_solve = MPI_Wtime();
 	solveLinearSystem(local_A, local_b, x, n, local_n, procidx, totalprocs);
+	if (procidx == 0)
+		t_solve = MPI_Wtime() - t_solve;
 
 	if (procidx == 0)
 	{
@@ -107,13 +127,27 @@ int main(int argc, char **argv)
 		free(displs_b);
 	}
 
-	// Aguarda todos os processos finalizarem
+	// Garante que todos os processos finalizaram antes de exibir os resultados finais
+	// O `solveLinearSystem` já fará isso, então essa barreira é só como garantia de que
+	// as mensagens de resultado aparecerão por último
 	MPI_Barrier(MPI_COMM_WORLD);
 
 	if (procidx == 0)
 	{
+		t_test = MPI_Wtime();
 		int nerros = testLinearSystem(A, b, x, n);
-		printf("Errors=%d\n", nerros);
+		t_test = MPI_Wtime() - t_test;
+
+		t_total = MPI_Wtime() - t_total;
+
+		printf("\n==== Resultados Finais ====\n");
+		printf("Tempo total de carregamento = %.6f segundos (%.1f%%)\n", t_load, (t_load / t_total) * 100);
+		printf("Tempo total de comunicação inicial = %.6f segundos (%.1f%%)\n", t_comm, (t_comm / t_total) * 100);
+		printf("Tempo total solveLinearSystem = %.6f segundos (%.1f%%)\n", t_solve, (t_solve / t_total) * 100);
+		printf("Tempo total testLinearSystem = %.6f segundos (%.1f%%)\n", t_test, (t_test / t_total) * 100);
+		printf("Tempo total de execução = %.6f segundos\n", t_total);
+		printf("Número de erros = %d\n", nerros);
+
 		saveResult(A, b, x, n);
 		free(A);
 		free(b);
@@ -200,7 +234,15 @@ void loadLinearSystem(int n, double *A, double *b)
 
 void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int local_n, int procidx, int totalprocs)
 {
-	DEBUG("solveLinearSystem");
+	DEBUG("Iniciando solveLinearSystem");
+
+	// Variáveis de tempo para este processo
+	double t_total; // Tempo total do processo
+	double t_start_local = MPI_Wtime(), t_end_local;
+	double t_comm = 0.0;				 // Tempo gasto em comunicação
+	double t_comp = 0.0;				 // Tempo gasto em computação
+	double t_idle = 0.0;				 // Tempo ocioso no pipeline (load imbalance)
+	double t_start_op, t_end_op; // Tempos temporários para operações
 
 	int pivot_row, pivot_owner, local_pivot_row, current_row_start, current_row, count,
 			pivot_unit, local_pivot_offset, local_pivot_buffer_mat_size, block_tag = 0, start_owner;
@@ -225,7 +267,7 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 	/* Gaussian Elimination */
 	for (pivot_row = 0; pivot_row < (n - 1); pivot_row++)
 	{
-		pivot_owner = pivot_row < threshold ? (pivot_owner = pivot_row / (base + 1)) : rem + (pivot_row - threshold) / base;
+		pivot_owner = pivot_row < threshold ? (pivot_row / (base + 1)) : rem + (pivot_row - threshold) / base;
 		start_owner = (pivot_owner < rem) ? (pivot_owner * (base + 1)) : (rem * (base + 1) + (pivot_owner - rem) * base);
 		local_pivot_row = pivot_row - start_owner;
 		// Calcula pivot_unit relativo ao início do processo dono
@@ -248,7 +290,10 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 						(pivot_row - pivot_unit), pivot_row, procidx + 1, block_tag, pivot_unit, local_pivot_buffer_mat_size);
 
 				// Usamos 'pivot_row' como tag da mensagem
+				t_start_op = MPI_Wtime();
 				MPI_Send(pivot_buffer, local_pivot_buffer_mat_size, MPI_DOUBLE, procidx + 1, block_tag, MPI_COMM_WORLD);
+				t_end_op = MPI_Wtime();
+				t_comm += t_end_op - t_start_op;
 				block_tag++;
 			}
 		}
@@ -268,12 +313,18 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 
 				// Este processo está "abaixo" do processo dono do pivô, então recebe as informações do pivô do
 				// processo anterior
+				t_start_op = MPI_Wtime();
 				MPI_Recv(pivot_buffer, local_pivot_buffer_mat_size, MPI_DOUBLE, procidx - 1, block_tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+				t_end_op = MPI_Wtime();
+				t_comm += t_end_op - t_start_op;
 
 				// Reenvio para o "próximo" processo (se eu não for o último)
 				if (procidx < totalprocs - 1)
 				{
+					t_start_op = MPI_Wtime();
 					MPI_Send(pivot_buffer, local_pivot_buffer_mat_size, MPI_DOUBLE, procidx + 1, block_tag, MPI_COMM_WORLD);
+					t_end_op = MPI_Wtime();
+					t_comm += t_end_op - t_start_op;
 				}
 
 				block_tag++;
@@ -282,7 +333,6 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 		else
 		{
 			// Pivô já está fora ("abaixo") da área desse processo, então não deve mais processar
-			// Ficará ocioso a partir de agora esperando os outros processos concluírem suas áreas
 			break;
 		}
 
@@ -340,12 +390,21 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 		}
 	}
 
+	// Primeiro sincroniza todos os processos para medir o tempo ocioso
+	t_idle = MPI_Wtime();
+	MPI_Barrier(MPI_COMM_WORLD);
+	t_idle = MPI_Wtime() - t_idle;
+
+	// Agora mede apenas o tempo efetivo de comunicação do Gatherv
+	t_start_op = MPI_Wtime();
 	MPI_Gatherv(local_A, local_n * n, MPI_DOUBLE,
 							res_A, recvcounts_A, recvdispls_A, MPI_DOUBLE,
 							0, MPI_COMM_WORLD);
 	MPI_Gatherv(local_b, local_n, MPI_DOUBLE,
 							res_b, recvcounts_b, recvdispls_b, MPI_DOUBLE,
 							0, MPI_COMM_WORLD);
+	t_end_op = MPI_Wtime();
+	t_comm += t_end_op - t_start_op;
 
 	if (procidx == 0)
 	{
@@ -355,11 +414,27 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 		free(recvdispls_b);
 	}
 
+	// Marca o tempo final
+	t_end_local = MPI_Wtime();
+
+	// Calcula o tempo total e de computação
+	t_total = t_end_local - t_start_local;
+	t_comp = t_total - t_comm - t_idle;
+
+	printf("\nProcesso %d:\n", procidx);
+	printf("  Tempo total = %.6f segundos\n", t_total);
+	printf("  Tempo de computação = %.6f segundos (%.1f%%)\n", t_comp, (t_comp / t_total) * 100);
+	printf("  Tempo de comunicação = %.6f segundos (%.1f%%)\n", t_comm, (t_comm / t_total) * 100);
+	printf("  Tempo ocioso no pipeline (load imbalance) = %.6f segundos (%.1f%%)\n", t_idle, (t_idle / t_total) * 100);
+
 	if (procidx != 0)
 	{
-		// A partir daqui, somente o processo 0 precisa calcular de forma sequencial
+		// Processos que não forem root não executam mais nada a partir daqui
 		return;
 	}
+
+	// Processo 0 continua com back-substitution
+	t_start_local = MPI_Wtime();
 
 	/* Back-substitution */
 	x[n - 1] = res_b[n - 1] / res_A[(n - 1) * n + n - 1];
@@ -375,4 +450,8 @@ void solveLinearSystem(double *local_A, double *local_b, double *x, int n, int l
 
 	free(res_A);
 	free(res_b);
+
+	// Calcula e exibe os tempos do processo 0
+	t_end_local = MPI_Wtime();
+	printf("\nTempo de execução do back-substitution = %.6f segundos\n", t_end_local - t_start_local);
 }

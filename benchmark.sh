@@ -42,7 +42,7 @@ for (( i=1; i<=$TIMES; i++ )); do
     
     # Executa o comando com DEBUG=1 e captura toda a saída (stdout e stderr)
     # A variável BLOCK_SIZE é passada para o ambiente do mpirun
-    output=$(BLOCK_SIZE=$BLOCK_SIZE_PARAM mpirun -np $NP ./gauss_mpi $N 2>&1)
+    output=$(BLOCK_SIZE=$BLOCK_SIZE_PARAM mpirun -np $NP --hostfile hosts ./gauss_mpi $N 2>&1)
     
     # --- Anexa a saída completa ao arquivo de log ---
     echo "--- Execução $i/$TIMES ---" >> "$LOG_FILE"

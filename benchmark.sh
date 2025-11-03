@@ -39,18 +39,36 @@ declare -a solve_times_list
 
 for (( i=1; i<=$TIMES; i++ )); do
     echo "Executando $i/$TIMES..."
-    
-    # Executa o comando com DEBUG=1 e captura toda a saída (stdout e stderr)
-    # A variável BLOCK_SIZE é passada para o ambiente do mpirun
-    output=$(BLOCK_SIZE=$BLOCK_SIZE_PARAM mpirun -np $NP --hostfile hosts ./gauss_mpi $N 2>&1)
-    
-    # --- Anexa a saída completa ao arquivo de log ---
     echo "--- Execução $i/$TIMES ---" >> "$LOG_FILE"
-    echo "$output" >> "$LOG_FILE"
-    echo "" >> "$LOG_FILE" # Adiciona uma linha em branco para legibilidade
     
-    # --- CORREÇÃO: Captura "Tempo total solveLinearSystem" ---
-    # com base no printf do seu código
+    # Desabilita 'set -e' temporariamente
+    set +e 
+    
+    # 1. Executa o mpirun
+    # 2. Redireciona stderr para stdout (2>&1)
+    # 3. Usa 'tee -a' para anexar a saída ao log EM TEMPO REAL (streaming)
+    # 4. A saída de 'tee' (que é a mesma) é capturada pela variável 'output'
+    output=$(BLOCK_SIZE=$BLOCK_SIZE_PARAM mpirun -np $NP --hostfile hosts ./gauss_mpi $N 2>&1 | tee -a "$LOG_FILE")
+    
+    # Captura o código de saída do mpirun (índice 0), não do tee (índice 1)
+    # Isso funciona por causa do 'set -o pipefail' no topo do script
+    execution_exit_code=${PIPESTATUS[0]} 
+    
+    # Reabilita 'set -e'
+    set -e 
+    
+    # Adiciona uma linha em branco ao log para legibilidade,
+    # independentemente do resultado
+    echo "" >> "$LOG_FILE" 
+
+    # --- Verificação de Erro da Execução ---
+    if [ $execution_exit_code -ne 0 ]; then
+        echo "Erro na execução $i: mpirun falhou com código de saída $execution_exit_code."
+        echo "A saída (parcial ou completa) foi registrada em $LOG_FILE."
+        exit 2 # Aborta o script de benchmark
+    fi
+    
+    # --- Captura "Tempo total solveLinearSystem" ---
     solve_time=$(echo "$output" | grep "Tempo total solveLinearSystem" | awk '{print $5}')
     
     if [ -z "$solve_time" ]; then

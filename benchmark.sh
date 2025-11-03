@@ -37,6 +37,47 @@ declare -a solve_times_list
 # Limpa o arquivo de log para esta nova execução
 > "$LOG_FILE"
 
+# --- Coleta informações da máquina (Processador, RAM, GPU) ---
+CPU_INFO="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed -E 's/.*: //')"
+if [ -z "$CPU_INFO" ]; then
+    CPU_INFO="$(lscpu 2>/dev/null | grep 'Model name' | sed -E 's/.*: //')"
+fi
+
+RAM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+if [ -n "$RAM_KB" ]; then
+    # Converte KB -> GiB e arredonda para inteiro mais próximo (ex.: 15.5 -> 16)
+    RAM_GB=$(awk -v kb=$RAM_KB 'BEGIN{printf "%d", int((kb/1024/1024)+0.5)}')
+    RAM_INFO="${RAM_GB}GiB"
+else
+    RAM_INFO="Unknown"
+fi
+
+GPU_INFO="Unknown"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_INFO="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
+elif command -v lspci >/dev/null 2>&1; then
+    GPU_INFO="$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | head -n1 | sed -E 's/^[^:]+: //')"
+fi
+
+# Sanitiza strings para JSON (escapa aspas se houver)
+CPU_INFO_JSON=$(printf '%s' "$CPU_INFO" | sed 's/"/\\"/g')
+RAM_INFO_JSON=$(printf '%s' "$RAM_INFO" | sed 's/"/\\"/g')
+GPU_INFO_JSON=$(printf '%s' "$GPU_INFO" | sed 's/"/\\"/g')
+
+# Escreve cabeçalho no log com informações da máquina
+echo "==== Benchmark iniciado: $TIMESTAMP ====" >> "$LOG_FILE"
+echo "Processador: $CPU_INFO" >> "$LOG_FILE"
+echo "RAM: $RAM_INFO" >> "$LOG_FILE"
+echo "Placa de Vídeo: $GPU_INFO" >> "$LOG_FILE"
+echo "------------------------------------" >> "$LOG_FILE"
+
+# Exibe no console também
+echo "Informações da máquina:"
+echo "  Processador: $CPU_INFO"
+echo "  RAM: $RAM_INFO"
+echo "  Placa de Vídeo: $GPU_INFO"
+echo "------------------------------------"
+
 for (( i=1; i<=$TIMES; i++ )); do
     echo "Executando $i/$TIMES..."
     echo "--- Execução $i/$TIMES ---" >> "$LOG_FILE"
@@ -111,8 +152,8 @@ echo "Desvio Padrão (solveLinearSystem): $std_dev s"
 # --- 5. Geração do JSON ---
 
 # Formata a lista de tempos do bash para uma lista JSON
-json_list=$(printf "%s," "${solve_times_list[@]}")
-json_list="[${json_list%,}]" # Remove a vírgula final
+json_list=$(printf "%s, " "${solve_times_list[@]}")
+json_list="[${json_list%, }]" # Remove a vírgula final
 
 # Escreve o arquivo JSON
 cat << EOF > $JSON_FILE
@@ -123,7 +164,12 @@ cat << EOF > $JSON_FILE
     "BLOCK_SIZE": $BLOCK_SIZE_PARAM,
     "times": $TIMES
   },
-  "log_file": "$LOG_FILE",
+  "log": "$LOG_FILE",
+  "info_maquina": {
+    "cpu": "${CPU_INFO_JSON}",
+    "ram": "${RAM_INFO_JSON}",
+    "gpu": "${GPU_INFO_JSON}"
+  },
   "tempos_solve_s": $json_list,
   "estatisticas": {
     "media_s": "$average",

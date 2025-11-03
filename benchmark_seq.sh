@@ -34,18 +34,66 @@ declare -a solve_times_list
 # Limpa o arquivo de log para esta nova execução
 > "$LOG_FILE"
 
+# --- Coleta informações da máquina (Processador, RAM, GPU) ---
+CPU_INFO="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed -E 's/.*: //')"
+if [ -z "$CPU_INFO" ]; then
+    CPU_INFO="$(lscpu 2>/dev/null | grep 'Model name' | sed -E 's/.*: //')"
+fi
+
+RAM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+if [ -n "$RAM_KB" ]; then
+    # Converte KB -> GiB e arredonda para inteiro mais próximo
+    RAM_GB=$(awk -v kb=$RAM_KB 'BEGIN{printf "%d", int((kb/1024/1024)+0.5)}')
+    RAM_INFO="${RAM_GB}GiB"
+else
+    RAM_INFO="Unknown"
+fi
+
+GPU_INFO="Unknown"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_INFO="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
+elif command -v lspci >/dev/null 2>&1; then
+    GPU_INFO="$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | head -n1 | sed -E 's/^[^:]+: //')"
+fi
+
+# Sanitiza strings para JSON (escapa aspas se houver)
+CPU_INFO_JSON=$(printf '%s' "$CPU_INFO" | sed 's/"/\\"/g')
+RAM_INFO_JSON=$(printf '%s' "$RAM_INFO" | sed 's/"/\\"/g')
+GPU_INFO_JSON=$(printf '%s' "$GPU_INFO" | sed 's/"/\\"/g')
+
+# Escreve cabeçalho no log com informações da máquina
+echo "==== Benchmark seq iniciado: $TIMESTAMP ====" >> "$LOG_FILE"
+echo "Processador: $CPU_INFO" >> "$LOG_FILE"
+echo "RAM: $RAM_INFO" >> "$LOG_FILE"
+echo "Placa de Vídeo: $GPU_INFO" >> "$LOG_FILE"
+echo "------------------------------------" >> "$LOG_FILE"
+
+# Exibe no console também
+echo "Informações da máquina:"
+echo "  Processador: $CPU_INFO"
+echo "  RAM: $RAM_INFO"
+echo "  Placa de Vídeo: $GPU_INFO"
+echo "------------------------------------"
+
 for (( i=1; i<=$TIMES; i++ )); do
     echo "Executando $i/$TIMES..."
-    
-    # Executa o comando 'make runseq' sobrescrevendo a variável 'n' do Makefile
-    # Assumimos que a versão sequencial também imprime "DEBUG=1"
-    # Captura stdout e stderr
-    output=$(DEBUG=1 make runseq n=$N 2>&1)
-    
-    # --- Anexa a saída completa ao arquivo de log ---
-    echo "--- Execução $i/$TIMES ---" >> "$LOG_FILE"
-    echo "$output" >> "$LOG_FILE"
-    echo "" >> "$LOG_FILE" # Adiciona uma linha em branco
+    echo "--- Execução $i/$TIMES ---" >> $LOG_FILE
+
+    # Desabilita 'set -e' temporariamente para capturar o código de saída manualmente
+    set +e
+    output=$(make runseq n=$N 2>&1 | tee -a "$LOG_FILE")
+    execution_exit_code=${PIPESTATUS[0]}
+    set -e
+
+    # Adiciona uma linha em branco ao log para legibilidade
+    echo "" >> "$LOG_FILE"
+
+    # Verifica se o comando falhou
+    if [ $execution_exit_code -ne 0 ]; then
+        echo "Erro na execução $i: comando 'make runseq' falhou com código de saída $execution_exit_code."
+        echo "A saída (parcial ou completa) foi registrada em $LOG_FILE."
+        exit 2
+    fi
     
     # Captura "Tempo total solveLinearSystem"
     # Assumimos que o printf é idêntico ao da versão mpi [cite: 1, `printf("Tempo total solveLinearSystem = %.6f segundos (%.1f%%)\n", t_solve, (t_solve / t_total) * 100);`]
@@ -103,7 +151,12 @@ cat << EOF > $JSON_FILE
     "BLOCK_SIZE": null,
     "times": $TIMES
   },
-  "log_file": "$LOG_FILE",
+  "log": "$LOG_FILE",
+  "info_maquina": {
+    "cpu": "${CPU_INFO_JSON}",
+    "ram": "${RAM_INFO_JSON}",
+    "gpu": "${GPU_INFO_JSON}"
+  },
   "tempos_solve_s": $json_list,
   "estatisticas": {
     "media_s": "$average",

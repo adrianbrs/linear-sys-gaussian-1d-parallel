@@ -1,6 +1,6 @@
-n?=2000
+n?=7500
 np?=4
-bsize?=20
+bsize?=1
 times?=5
 
 build:
